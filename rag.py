@@ -23,12 +23,31 @@ if not groq_api_key:
     st.error("❌ GROQ_API_KEY not found in .env file")
     st.stop()
 
+FAISS_INDEX_PATH = "faiss_index"  # folder where index is saved on disk
+
+def get_embeddings():
+    return HuggingFaceEmbeddings(
+        model_name="all-MiniLM-L6-v2",
+        model_kwargs={"device": "cpu"}
+    )
+
+def load_website(url):
+    loader = WebBaseLoader(
+        web_paths=[url],
+        bs_kwargs={
+            "parse_only": bs4.SoupStrainer(
+                ["p", "table", "tr", "td", "th", "h1", "h2", "h3", "li"]
+            )
+        }
+    )
+    docs = loader.load()
+    return [doc for doc in docs if doc.page_content.strip()]
+
 def load_pdfs_from_folder(folder):
     all_docs = []
     if not os.path.exists(folder):
         return all_docs
-    pdf_files = [f for f in os.listdir(folder) if f.endswith(".pdf")]
-    for pdf_file in pdf_files:
+    for pdf_file in [f for f in os.listdir(folder) if f.endswith(".pdf")]:
         path = os.path.join(folder, pdf_file)
         doc = fitz.open(path)
         for page_num, page in enumerate(doc):
@@ -40,21 +59,9 @@ def load_pdfs_from_folder(folder):
                 ))
     return all_docs
 
-def load_website(url):
-    loader = WebBaseLoader(
-        web_paths=[url],
-        bs_kwargs={
-            "parse_only": bs4.SoupStrainer(
-                ["p", "table", "tr", "td", "th", "h1", "h2", "h3", "li","code", "pre"]
-            )
-        }
-    )
-    docs = loader.load()
-    return [doc for doc in docs if doc.page_content.strip()]
-
-if "vector_store" not in st.session_state:
-    with st.spinner("Loading and indexing website..."):
-
+def build_and_save_index():
+    """Load all sources, build FAISS index, save to disk."""
+    with st.spinner("Building index for the first time — this won't happen again..."):
         urls = [
             "https://www.django-rest-framework.org/api-guide/requests/",
             "https://www.django-rest-framework.org/api-guide/responses/",
@@ -82,50 +89,53 @@ if "vector_store" not in st.session_state:
             "https://www.django-rest-framework.org/api-guide/exceptions/",
             "https://www.django-rest-framework.org/api-guide/status-codes/",
             "https://www.django-rest-framework.org/api-guide/testing/",
-            "https://www.django-rest-framework.org/api-guide/settings/",
-            "https://www.django-rest-framework.org/topics/documenting-your-api/",
-            "https://www.django-rest-framework.org/topics/internationalization/",
-            "https://www.django-rest-framework.org/topics/ajax-csrf-cors/",
-            "https://www.django-rest-framework.org/topics/html-and-forms/",
-            "https://www.django-rest-framework.org/topics/browser-enhancements/",
-            "https://www.django-rest-framework.org/topics/browsable-api/",
-            "https://www.django-rest-framework.org/topics/rest-hypermedia-hateoas/"
+            "https://www.django-rest-framework.org/api-guide/settings/"
         ]
 
         all_docs = []
         for url in urls:
             all_docs.extend(load_website(url))
+        all_docs.extend(load_pdfs_from_folder("data"))
 
-        pdf_docs = load_pdfs_from_folder("data")    
-        all_docs.extend(pdf_docs)
-            
         if not all_docs:
-            st.error("❌ No content extracted — site may be behind a login or JavaScript-rendered")
+            st.error("❌ No content extracted from any source")
             st.stop()
-
-        st.success(f"✅ Indexed {len(all_docs)} document(s)")
-
-        embeddings = HuggingFaceEmbeddings(
-            model_name="all-MiniLM-L6-v2",
-            model_kwargs={"device": "cpu"}
-        )
 
         splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
         final_documents = splitter.split_documents(all_docs)
 
-        if not final_documents:
-            st.error("❌ Text splitting produced no chunks")
-            st.stop()
+        embeddings = get_embeddings()
+        vector_store = FAISS.from_documents(final_documents, embeddings)
 
-        st.session_state.vector_store = FAISS.from_documents(final_documents, embeddings)
-        st.session_state.embeddings = embeddings
+        # Save to disk — next run will load from here instead
+        vector_store.save_local(FAISS_INDEX_PATH)
+        st.success(f"✅ Index built and saved — {len(final_documents)} chunks indexed")
+        return vector_store
 
-st.title("Django REST Framework RAG Demo")
+# ── Load or build index ───────────────────────────────────────────────────────
+if "vector_store" not in st.session_state:
+    embeddings = get_embeddings()
+
+    if os.path.exists(FAISS_INDEX_PATH):
+        # Index already exists on disk — just load it (fast)
+        st.session_state.vector_store = FAISS.load_local(
+            FAISS_INDEX_PATH,
+            embeddings,
+            allow_dangerous_deserialization=True
+        )
+        st.success("✅ Index loaded from disk")
+    else:
+        # First run — build and save
+        st.session_state.vector_store = build_and_save_index()
+
+st.title("Django REST Framework RAG")
 
 llm = ChatGroq(groq_api_key=groq_api_key, model_name="llama-3.1-8b-instant")
 
 prompt_template = ChatPromptTemplate.from_messages([
-    ("system", """Answer only based on the context below. If the answer is not contained within the context, say you don't know. Always use all available context to provide the best answer possible. Answer only questions related to django rest framework. Do not attempt to answer questions about other topics. If the question is not about django rest framework, say you don't know.
+    ("system", """Answer only based on the context below. If the answer is not contained
+within the context, say you don't know. Answer only questions related to Django REST
+Framework. If the question is not about Django REST Framework, say you don't know.
 <context>
 {context}
 </context>"""),
@@ -148,3 +158,14 @@ if user_prompt:
     response = chain.invoke(user_prompt)
     st.write(response)
     st.caption(f"Response time: {time.process_time() - start:.2f}s")
+
+# Optional: button to force rebuild if sources change
+with st.sidebar:
+    st.header("Index Management")
+    if st.button("🔄 Reload"):
+        import shutil
+        if os.path.exists(FAISS_INDEX_PATH):
+            shutil.rmtree(FAISS_INDEX_PATH)
+        if "vector_store" in st.session_state:
+            del st.session_state["vector_store"]
+        st.rerun()
